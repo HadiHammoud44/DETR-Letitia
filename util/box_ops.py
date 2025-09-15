@@ -1,6 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
 Utilities for bounding box manipulation and GIoU.
+
+Used by the original DETR code, but not for letitia.
 """
 import torch
 from torchvision.ops.boxes import box_area

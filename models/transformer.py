@@ -45,18 +45,34 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed):
-        # flatten NxCxHxW to HWxNxC
-        bs, c, h, w = src.shape
-        src = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        # Handle 1D point cloud sequences: src is [seq_len, batch, hidden_dim]
+        # src already comes transposed from detr.py: [max_tokens, batch, hidden_dim]
+        seq_len, bs, hidden_dim = src.shape
+        
+        # Handle positional embedding (None for point clouds)
+        if pos_embed is not None:
+            # If position embedding is provided, ensure correct shape
+            if pos_embed.dim() == 3:  # [batch, hidden_dim, seq_len]
+                pos_embed = pos_embed.permute(2, 0, 1)  # [seq_len, batch, hidden_dim]
+            elif pos_embed.dim() == 2:  # [batch, seq_len] 
+                pos_embed = pos_embed.transpose(0, 1).unsqueeze(-1).expand(seq_len, bs, hidden_dim)
+        else:
+            # For point clouds with zero positional encoding
+            pos_embed = torch.zeros_like(src)
+        
+        # Prepare query embeddings: [num_queries, batch, hidden_dim]
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-        mask = mask.flatten(1)
-
+        
+        # Key padding mask: mask is [batch, seq_len], no need to flatten for 1D sequences
+        # PyTorch expects key_padding_mask as [batch, seq_len] where True = ignore
+        
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
-        return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+        
+        # Return: [num_decoder_layers, batch, num_queries, hidden_dim], memory
+        return hs.transpose(1, 2), memory
 
 
 class TransformerEncoder(nn.Module):

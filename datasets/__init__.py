@@ -2,24 +2,18 @@
 import torch.utils.data
 import torchvision
 
-from .coco import build as build_coco
-
-
-def get_coco_api_from_dataset(dataset):
-    for _ in range(10):
-        # if isinstance(dataset, torchvision.datasets.CocoDetection):
-        #     break
-        if isinstance(dataset, torch.utils.data.Subset):
-            dataset = dataset.dataset
-    if isinstance(dataset, torchvision.datasets.CocoDetection):
-        return dataset.coco
+from .letitia_ds import build_letitia_dataset, custom_collate_fn
 
 
 def build_dataset(image_set, args):
-    if args.dataset_file == 'coco':
-        return build_coco(image_set, args)
-    if args.dataset_file == 'coco_panoptic':
-        # to avoid making panopticapi required for coco
-        from .coco_panoptic import build as build_coco_panoptic
-        return build_coco_panoptic(image_set, args)
+    # This also includes the Synthetic dataset
+    if args.dataset_file == 'letitia':
+        return build_letitia_dataset(
+            data_root=args.data_root,
+            split=image_set,
+            split_ratio=args.split_ratio,
+            transforms=None,  # Add transforms later if needed
+            seed=args.seed
+        )
+
     raise ValueError(f'dataset {args.dataset_file} not supported')

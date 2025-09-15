@@ -5,6 +5,16 @@
 .DS_Store
 .*.swp
 *.pth
+*.pt
+*.txt
+*.json
+data/
+outputs/
+outputs_letitia/
+README_files/
+IGNORE/
+test_scripts/
+visualization_outputs/
 **/__pycache__/**
 .ipynb_checkpoints/
 datasets/data/
