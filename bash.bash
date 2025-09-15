@@ -16,7 +16,7 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nouni
 # Environment setup
 echo "=== Setting up environment ==="
 source /opt/conda/etc/profile.d/conda.sh
-conda activate /mnt/letitia/scratch/students/hhammoud/conda_env
+conda activate conda_env  # Replace with your conda environment name/path
 
 # Verify conda environment
 echo "Python version: $(python --version)"
@@ -25,10 +25,10 @@ echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available()
 echo "GPU count: $(python -c 'import torch; print(torch.cuda.device_count())')"
 
 # Change to project directory
-cd /mnt/letitia/scratch/students/hhammoud/detr
+cd /path/to/your/project  # Replace with your project path
 
 # Create output directory if it doesn't exist
-OUTPUT_DIR='/mnt/letitia/scratch/students/hhammoud/detr/outputs_letitia_new/last' #### !!!!!!!!!!!!! ####
+OUTPUT_DIR='path/to/output/directory'
 mkdir -p "$OUTPUT_DIR"
 
 # Log the command being executed
@@ -39,21 +39,21 @@ echo "Output directory: $OUTPUT_DIR"
 python main.py \
     --device='cuda' \
     --output_dir="$OUTPUT_DIR" \
-    --enc_layers=1 \
-    --dec_layers=1 \
+    --enc_layers=3 \
+    --dec_layers=3 \
     --original_feature_size=113 \
-    --hidden_dim=80 \
-    --dim_feedforward=320 \
-    --nheads=5 \
+    --hidden_dim=128 \
+    --dim_feedforward=512 \
+    --nheads=8 \
     --num_queries=63 \
     --epochs=1000 \
     --batch_size=8 \
-    --weight_decay=0.01 \
+    --weight_decay=0.001 \
     --clip_max_norm=1 \
     --dropout=0.1 \
     --num_workers=4 \
-    --lr_drop=100000 \
-    --data_root='/mnt/letitia/scratch/H_data/SAME/tensor_features_nosubclass/' \
+    --lr_drop=100000 \ 
+    --data_root='path/to/data/dir' \
     --superclass_loss_coef=1.0 \
     --coordinates_loss_coef=4.0 \
     --radiomics_loss_coef=5.0 \
