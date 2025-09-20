@@ -130,20 +130,21 @@ def compute_class_metrics(pred_classes: torch.Tensor, tgt_classes: torch.Tensor)
 
 def compute_coordinate_error(pred_coords: torch.Tensor, tgt_coords: torch.Tensor) -> Dict[str, float]:
     """
-    Compute coordinate prediction errors (L2 distance)
+    Compute coordinate prediction errors (mean L2 distance and MSE)
     
     Args:
         pred_coords: [N, 3] tensor of predicted coordinates
         tgt_coords: [N, 3] tensor of target coordinates
         
     Returns:
-        Dict with mean and std of L2 errors
+        Dict with mean L2 error and MSE value
     """
     l2_errors = torch.norm(pred_coords - tgt_coords, dim=-1)  # [N]
+    mse_error = torch.mean(l2_errors ** 2)
     
     return {
-        'coord_error_mean': l2_errors.mean().item(),
-        'coord_error_std': l2_errors.std().item() if len(l2_errors) > 1 else 0.0
+        'coord_l2': l2_errors.mean().item(),
+        'coord_mse': mse_error.item()
     }
 
 
@@ -157,7 +158,7 @@ def compute_feature_error(pred_features: torch.Tensor, tgt_features: torch.Tenso
         empty_pt: [N] tensor of binary flags indicating empty second half (optional)
         
     Returns:
-        Dict with mean and std of MSE errors
+        Dict with MSE value
     """
     if empty_pt is not None:
         # Same logic as loss_radiomics: selective computation with masking
@@ -180,28 +181,23 @@ def compute_feature_error(pred_features: torch.Tensor, tgt_features: torch.Tenso
         # Apply mask to second half error
         masked_mse_second_half = mse_second_half * non_empty_mask
         
-        # Combine errors - exactly like loss_radiomics
+        # Combine errors
         total_error = mse_first_half.sum() + masked_mse_second_half.sum()
         
-        # Normalize by total number of valid elements - exactly like loss_radiomics
+        # Normalize by total number of valid elements
         num_first_half_elements = mse_first_half.numel()
         num_second_half_elements = non_empty_mask.sum().item() * (radiomics_dim - half_dim)
         total_elements = num_first_half_elements + num_second_half_elements
         
         mean_error = total_error / total_elements
         
-        # std ignored for masked computation
-        std_error = -1.0
-        
     else:
         # Standard computation without masking
         mse_errors = torch.nn.functional.mse_loss(pred_features, tgt_features, reduction='none')
-        mean_error = mse_errors.mean().item()
-        std_error = mse_errors.std().item() if mse_errors.numel() > 1 else 0.0
+        mean_error = mse_errors.mean()
     
     return {
-        'feature_error_mean': mean_error.item() if torch.is_tensor(mean_error) else mean_error,
-        'feature_error_std': std_error
+        'radiomics_mse': mean_error.item(),
     }
 
 

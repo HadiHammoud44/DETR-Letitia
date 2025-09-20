@@ -230,10 +230,12 @@ def evaluate(model, criterion, data_loader, device, args):
     # T0->T1 Prediction Results
     if any(key.startswith('t1_') for key in results.keys()):
         print("T0 -> T1 Prediction:")
-        if 't1_coord_error_mean' in results:
-            print(f"  Coordinate Error: {results['t1_coord_error_mean']:.4f}")
-        if 't1_feature_error_mean' in results:
-            print(f"  Feature Error: {results['t1_feature_error_mean']:.4f}")
+        if 't1_coord_l2' in results:
+            print(f"  Coordinate Error: {results['t1_coord_l2']:.4f}")
+        if 't1_coord_mse' in results:
+            print(f"  Coordinate Error: {results['t1_coord_mse']:.4f}")
+        if 't1_radiomics_mse' in results:
+            print(f"  Feature Error: {results['t1_radiomics_mse']:.4f}")
         if 't1_superclass_accuracy' in results:
             print(f"  Superclass: Acc={results['t1_superclass_accuracy']:.3f}, F1={results.get('t1_superclass_f1', 0.0):.3f}")
         print()
@@ -241,10 +243,12 @@ def evaluate(model, criterion, data_loader, device, args):
     # T1->T2 Prediction Results
     if any(key.startswith('t2_') for key in results.keys()):
         print("T1 -> T2 Prediction:")
-        if 't2_coord_error_mean' in results:
-            print(f"  Coordinate Error: {results['t2_coord_error_mean']:.4f}")
-        if 't2_feature_error_mean' in results:
-            print(f"  Feature Error: {results['t2_feature_error_mean']:.4f}")
+        if 't2_coord_l2' in results:
+            print(f"  Coordinate Error: {results['t2_coord_l2']:.4f}")
+        if 't2_coord_mse' in results:
+            print(f"  Coordinate Error: {results['t2_coord_mse']:.4f}")
+        if 't2_radiomics_mse' in results:
+            print(f"  Feature Error: {results['t2_radiomics_mse']:.4f}")
         if 't2_superclass_accuracy' in results:
             print(f"  Superclass: Acc={results['t2_superclass_accuracy']:.3f}, F1={results.get('t2_superclass_f1', 0.0):.3f}")
         print()

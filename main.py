@@ -146,9 +146,6 @@ def main(args):
         # 0D/1D params: biases, norm weights, temps etc.
         is_scalar_or_1d = (p.ndim <= 1)
 
-        # true embedding tables by module type
-        is_embedding_table = isinstance(parent_mod, torch.nn.Embedding)
-
         # positional embeddings (narrow patterns)
         is_pos_embed = any(t in lname for t in [
             "pos_embed", "position_embed", "temporal_embed", "temp_embed"
@@ -159,7 +156,7 @@ def main(args):
             "relative_position_bias_table", "rel_pos_bias", "rel_pos_table"
         ])
 
-        if (is_scalar_or_1d or is_embedding_table or is_pos_embed or is_rel_pos_table):
+        if (is_scalar_or_1d or is_pos_embed or is_rel_pos_table):
             no_decay.append(p)
             no_decay_names.append(name)
         else:

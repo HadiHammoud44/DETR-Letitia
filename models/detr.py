@@ -163,7 +163,7 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_coordinates(self, outputs, targets, indices, num_boxes):
-        """Compute the 3D coordinates prediction loss (L2 distance)
+        """Compute the 3D coordinates prediction loss (MSE)
            targets dicts must contain the key "coordinates" containing a tensor of dim [nb_target_boxes, 3]
         """
         assert 'pred_coordinates' in outputs
@@ -171,7 +171,7 @@ class SetCriterion(nn.Module):
         src_coordinates = outputs['pred_coordinates'][idx]
         target_coordinates = torch.cat([t['coordinates'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        # L2 distance loss for 3D coordinates
+        # MSE loss for 3D coordinates
         loss_coordinates = F.mse_loss(src_coordinates, target_coordinates, reduction='none')
 
         losses = {}
@@ -179,7 +179,7 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_radiomics(self, outputs, targets, indices, num_boxes):
-        """Compute the selective radiomics prediction loss (L2 distance)
+        """Compute the selective radiomics prediction loss (MSE)
            targets dicts must contain the key "radiomics" containing a tensor of dim [nb_target_boxes, feature_size]
            and "empty_pt" containing a tensor of dim [nb_target_boxes] with binary flags
            
