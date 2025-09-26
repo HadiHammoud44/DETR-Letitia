@@ -6,16 +6,15 @@ A PyTorch implementation of Facebook's DETR adapted for temporal point cloud for
 
 ### Prerequisites
 
-- Python 3.8+
-- PyTorch 1.8+
-- CUDA-compatible GPU (recommended)
+- Python 3.11+
+- PyTorch 2.5+
 
 ### Installation
 
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd detr
+cd detr-letitia
 
 # Install dependencies
 pip install torch torchvision numpy pathlib
@@ -32,27 +31,27 @@ Your data should be organized in the following structure:
 ```
 data_root/
 ├── TP0/           # Baseline timestep
-│   ├── 001.pt
-│   ├── 002.pt
+│   ├── 1.pt
+│   ├── 2.pt
 │   └── ...
 ├── TP1/           # First follow-up
-│   ├── 001.pt
-│   ├── 002.pt
+│   ├── 1.pt
+│   ├── 2.pt
 │   └── ...
 └── TP2/           # Second follow-up
-    ├── 001.pt
-    ├── 002.pt
+    ├── 1.pt
+    ├── 2.pt
     └── ...
 ```
 
 ### Point Cloud Format
 
-Each `.pt` file should contain a PyTorch tensor of shape `[num_points, 113]` with features:
+Each `.pt` file would contain a PyTorch tensor of shape `[num_points, num_features]` with features:
 ```python
 # Feature organization per point:
 [x, y, z,                    # 3D coordinates
- radiomics_features,         # 113 radiomics features from medical imaging
- empty_pt,                   # Binary flag (0/1) for missing PET features
+ radiomics_features,         # radiomics features from medical imaging, in this case 54 CT + 54 PET radiomics
+ empty_pt,                   # Binary flag (0/1) for missing PET radiomics features
  superclass_label]           # Anatomical classification (0=organ, 1=lesion)
 ```
 
@@ -69,7 +68,7 @@ print(info)
 # {
 #     'total_features': 113,
 #     'num_coordinates': 3,
-#     'num_radiomics': 113,
+#     'num_radiomics': 108,
 #     'num_superclasses': 2
 # }
 ```
@@ -84,7 +83,7 @@ python main.py \
     --output_dir ./outputs \
     --epochs 1000 \
     --lr 1e-4 \
-    --batch_size 1
+    --batch_size 8
 ```
 
 ### Training with Custom Validation Split
@@ -98,7 +97,7 @@ python main.py \
     --lr 1e-4
 ```
 
-### Advanced Training Configuration
+### Detailed Training Configuration
 
 ```bash
 python main.py \
@@ -167,7 +166,7 @@ nvidia-smi -l 1
 
 The model automatically evaluates on the validation set after each epoch, reporting:
 - **Classification metrics**: Accuracy, precision, recall, F1-score
-- **Spatial metrics**: Coordinate error statistics (L2 distance)
+- **Spatial metrics**: Coordinate error metrics (L2 distance and MSE)
 - **Feature metrics**: Radiomics prediction error (MSE)
 
 ### Standalone Evaluation
@@ -186,13 +185,15 @@ The evaluation provides comprehensive metrics for both prediction steps:
 
 **T0 → T1 Prediction:**
 - `t1_superclass_accuracy`: Classification accuracy
-- `t1_coord_error_mean`: Average spatial error
-- `t1_feature_error_mean`: Average radiomics error
+- `t1_coord_l2`: Average L2 spatial error
+- `t1_coord_mse`: Mean squared coordinate error
+- `t1_radiomics_mse`: Radiomics feature MSE
 
 **T1 → T2 Prediction:**
 - `t2_superclass_accuracy`: Classification accuracy  
-- `t2_coord_error_mean`: Average spatial error
-- `t2_feature_error_mean`: Average radiomics error
+- `t2_coord_l2`: Average L2 spatial error
+- `t2_coord_mse`: Mean squared coordinate error
+- `t2_radiomics_mse`: Radiomics feature MSE
 
 ## ⚙️ Model Configuration
 
@@ -211,20 +212,6 @@ The evaluation provides comprehensive metrics for both prediction steps:
 --hidden_dim 128            # Hidden dimension
 ```
 
-### Advanced Options
-
-```bash
-# Gradient clipping
---clip_max_norm 1
-
-# Learning rate scheduling
---lr_drop 40000             # LR drop epoch (step-based, ignored)
---lr_gamma 0.5              # LR decay factor
-
-# Auxiliary losses (from intermediate decoder layers)
---aux_loss                  # Enable auxiliary losses
-```
-
 ## 🔍 Understanding the Model
 
 ### Model Architecture
@@ -232,7 +219,7 @@ The evaluation provides comprehensive metrics for both prediction steps:
 1. **Backbone**: Independent MLP for per-point feature extraction
 2. **Encoder**: Multi-head self-attention over point sequences
 3. **Decoder**: Cross-attention between queries and encoded features
-4. **Heads**: Separate prediction heads for classification, coordinates, and radiomics
+4. **Output Heads**: Separate prediction heads for classification, coordinates, and radiomics
 
 ### Training Process
 
@@ -244,7 +231,7 @@ The evaluation provides comprehensive metrics for both prediction steps:
    - Input: T1 ground truth (teacher forcing)
    - Target: T2 ground truth
 
-3. **Loss**: Combined loss from both steps with gradient flow
+3. **Loss**: Combined loss from both steps
 
 ### Data Handling
 
