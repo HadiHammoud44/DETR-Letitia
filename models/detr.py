@@ -15,31 +15,102 @@ from .backbone import PointBackbone
 from .matcher import build_matcher
 from .transformer import build_transformer
 
+class PrototypeClassifier(nn.Module):
+    """
+    Prototype-based classifier using cosine similarity with learnable temperature and bias.
+    
+    Maps input features to prototype space, then computes cosine similarities with class prototypes.
+    Forms logits as τ · cos + b, where τ is learnable temperature and b is per-class bias.
+    """
+    
+    def __init__(self, input_dim: int, prototype_dim: int, num_classes: int, prototype_embeddings: nn.Embedding, num_layers: int = 2):
+        """
+        Initialize prototype classifier.
+        
+        Args:
+            input_dim: Dimension of input features (hidden_dim)
+            prototype_dim: Dimension of prototype space (subclass_dim)
+            num_classes: Number of classes (num_subclasses)
+            prototype_embeddings: Pre-trained prototype embeddings from backbone
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.prototype_dim = prototype_dim
+        
+        # Map input to prototype space
+        self.feature_mapper = MLP(input_dim, 2*input_dim, prototype_dim, num_layers)
+        
+        # Use the backbone's prototype embeddings (shared parameters)
+        self.prototype_embeddings = prototype_embeddings
+        
+        # Temperature parameter (global scale)
+        self.temperature = 3 * math.sqrt(prototype_dim)
+        
+        # Learnable per-class bias vector
+        self.bias = nn.Parameter(torch.zeros(num_classes))
+        
+    
+    def forward(self, x):
+        """
+        Forward pass through prototype classifier.
+        
+        Args:
+            x: Input features of shape [..., input_dim]
+            
+        Returns:
+            Logits of shape [..., num_classes]
+        """
+        # Map input to prototype space
+        mapped_features = self.feature_mapper(x)  # [..., prototype_dim]
+        
+        # L2-normalize mapped features
+        mapped_features = F.normalize(mapped_features, p=2, dim=-1)
+        
+        # Get prototype embeddings and L2-normalize them
+        prototypes = self.prototype_embeddings.weight  # [num_classes, prototype_dim]
+        prototypes = F.normalize(prototypes, p=2, dim=-1)
+        
+        # Compute cosine similarities
+        # mapped_features: [..., prototype_dim]
+        # prototypes: [num_classes, prototype_dim]
+        cos_similarities = torch.matmul(mapped_features, prototypes.T)  # [..., num_classes]
+        
+        # Form logits: τ · cos + b
+        logits = self.temperature * cos_similarities + self.bias
+        
+        return logits
+
 
 class DETR(nn.Module):
-    """ DETR module for anatomical organ/lesion forecasting """
-    def __init__(self, backbone, transformer, num_superclasses, num_queries, original_feature_size, aux_loss=False):
+    """ DETR module for anatomical organ/lesion forecasting with hierarchical classification """
+    def __init__(self, backbone, transformer, num_superclasses, num_subclasses, num_queries, original_feature_size, aux_loss=False, use_film=False):
         """ Initializes the model.
         Parameters:
             backbone: PointBackbone module for point cloud processing
             transformer: torch module of the transformer architecture
             num_superclasses: number of superclass categories
+            num_subclasses: number of subclass categories
             num_queries: number of object queries (max objects to predict)
             original_feature_size: size of original features per point
             aux_loss: True if auxiliary decoding losses are to be used
+            use_film: Whether to use FiLM conditioning
         """
         super().__init__()
         self.num_queries = num_queries
         self.transformer = transformer
         self.num_superclasses = num_superclasses
+        self.num_subclasses = num_subclasses
+        self.use_film = use_film
         hidden_dim = transformer.d_model
         
-        # Superclass classification head only
+        # Hierarchical classification heads
         self.superclass_embed = MLP(hidden_dim, 2*hidden_dim, num_superclasses + 1, num_layers=3) # include no-object class
+        self.subclass_embed = PrototypeClassifier(hidden_dim, backbone.subclass_dim, num_subclasses, backbone.subclass_embeddings, num_layers=2)
         
         # Radiomics prediction head (includes 3D coordinates + radiomics features)
-        # We predict coords + radiomics (excluding empty_pt and superclass)
-        self.radiomics_embed = MLP(hidden_dim, 2*hidden_dim, original_feature_size - 2, num_layers=3) # exclude empty_pt and superclass
+        # Note: original_feature_size now includes coords + radiomics + superclass + subclass
+        # We predict coords + radiomics (excluding both labels)
+        self.radiomics_embed = MLP(hidden_dim, 2*hidden_dim, original_feature_size - 2, num_layers=3) # exclude both labels
         
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         
@@ -57,6 +128,8 @@ class DETR(nn.Module):
             It returns a dict with the following elements:
                - "pred_superclass": The predicted superclass logits for all queries.
                                         Shape= [batch_size x num_queries x (num_superclasses + 1)]
+                - "pred_subclass": The predicted subclass logits for all queries.
+                                    Shape= [batch_size x num_queries x num_subclasses]  
                - "pred_coordinates": The 3D coordinates for all queries.
                                      Shape= [batch_size x num_queries x 3]
                - "pred_radiomics": The radiomics features for all queries.
@@ -67,7 +140,7 @@ class DETR(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         
-        features, _ = self.backbone(samples)  # No conditioning/position encoding returned
+        features, film_conditioning = self.backbone(samples)
 
         # For point clouds, features is directly a NestedTensor
         src = features.tensors  # [batch, max_tokens, hidden_dim]
@@ -79,10 +152,15 @@ class DETR(nn.Module):
         # For point clouds, position encoding is None
         pos = None
         
-        # Simplified transformer call
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos)[0]
+        # Pass FiLM conditioning if available
+        if self.use_film and film_conditioning is not None:
+            hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos, 
+                                film_conditioning=film_conditioning)[0]
+        else:
+            hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos)[0]
 
         outputs_superclass = self.superclass_embed(hs)
+        outputs_subclass = self.subclass_embed(hs)
         outputs_full_radiomics = self.radiomics_embed(hs)  # Full prediction including coords
         
         # Split the radiomics output: first 3 are coordinates, rest are radiomics features
@@ -91,42 +169,65 @@ class DETR(nn.Module):
         
         out = {
             'pred_superclass': outputs_superclass[-1], 
+            'pred_subclass': outputs_subclass[-1],
             'pred_coordinates': outputs_coordinates[-1],
             'pred_radiomics': outputs_radiomics[-1]
         }
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_superclass, outputs_coordinates, outputs_radiomics)
+            out['aux_outputs'] = self._set_aux_loss(outputs_superclass, outputs_subclass, outputs_coordinates, outputs_radiomics)
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_superclass, outputs_coordinates, outputs_radiomics):
+    def _set_aux_loss(self, outputs_superclass, outputs_subclass, outputs_coordinates, outputs_radiomics):
         # Auxiliary losses for intermediate decoder layers
-        return [{'pred_superclass': a, 'pred_coordinates': b, 'pred_radiomics': c}
-                for a, b, c in zip(outputs_superclass[:-1], outputs_coordinates[:-1], outputs_radiomics[:-1])]
+        return [{'pred_superclass': a, 'pred_subclass': b, 'pred_coordinates': c, 'pred_radiomics': d}
+                for a, b, c, d in zip(outputs_superclass[:-1], outputs_subclass[:-1], outputs_coordinates[:-1], outputs_radiomics[:-1])]
+
+    def update_ema_embeddings(self):
+        """
+        Update EMA embeddings in the backbone.
+        Should be called after each training step to update the input embeddings 
+        with exponential moving average of the output prototype embeddings.
+        """
+        self.backbone.update_ema_embeddings()
 
 
 class SetCriterion(nn.Module):
-    """ This class computes the loss for DETR.
+    """ This class computes the loss for DETR with hierarchical classification.
     The process happens in two steps:
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
-        2) we supervise each pair of matched ground-truth / prediction (supervise class and coordinates)
+        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_superclasses, matcher, weight_dict, losses, superclass_coef):
+    def __init__(self, num_superclasses, num_subclasses, matcher, weight_dict, eos_coef, losses):
         """ Create the criterion.
         Parameters:
             num_superclasses: number of superclass categories, omitting the special no-object category
+            num_subclasses: number of subclass categories, omitting the special no-object category
             matcher: module able to compute a matching between targets and proposals
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
-            superclass_coef: list of weights for each superclass to handle class imbalance including no-object.
         """
         super().__init__()
         self.num_superclasses = num_superclasses
+        self.num_subclasses = num_subclasses
         self.matcher = matcher
         self.weight_dict = weight_dict
+        self.eos_coef = eos_coef
         self.losses = losses
         
-        self.register_buffer('superclass_coef', torch.tensor(superclass_coef))
+        # Empty weights for superclass
+        empty_weight_super = torch.ones(self.num_superclasses + 1)
+        empty_weight_super[-1] = self.eos_coef
+        self.register_buffer('empty_weight_super', empty_weight_super)
+        
+        # Subclass weights with higher weight for specific minority classes # TODO: put as main.py argument
+        empty_weight_sub = torch.ones(self.num_subclasses)
+        high_weight_subclass_ids = [22, 24, 25, 28, 29, 31, 32, 33, 35, 36, 37, 45, 46, 50, 53, 54, 56, 57, 59, 60, 61, 62, 63, 64, 68, 69, 71, 72, 76, 78, 80, 82, 84, 87, 89, 90]
+        for subclass_id in high_weight_subclass_ids:
+            if subclass_id < self.num_subclasses:  # Safety check
+                empty_weight_sub[subclass_id] = 5.0 # based on rough class distribution
+        self.register_buffer('empty_weight_sub', empty_weight_sub)
 
     def loss_superclass_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Superclass classification loss (NLL)
@@ -141,12 +242,33 @@ class SetCriterion(nn.Module):
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.superclass_coef)
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight_super)
         losses = {'loss_superclass_ce': loss_ce}
 
         if log:
             losses['superclass_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
+
+    def loss_subclass_labels(self, outputs, targets, indices, num_boxes, log=True):
+        """Subclass classification loss (NLL) - for all queries matched to ground truth objects
+        targets dicts must contain the key "subclass" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_subclass' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_subclass_logits = outputs['pred_subclass'][idx]
+        
+        target_subclasses_o = torch.cat([t["subclass"][J] for t, (_, J) in zip(targets, indices)])
+        
+        
+        loss_ce = F.cross_entropy(src_subclass_logits, target_subclasses_o, weight=self.empty_weight_sub)
+        losses = {'loss_subclass_ce': loss_ce}
+        
+        if log:
+            losses['subclass_error'] = 100 - accuracy(src_subclass_logits, target_subclasses_o)[0]
+                
+        return losses
+
+
 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
@@ -179,57 +301,24 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_radiomics(self, outputs, targets, indices, num_boxes):
-        """Compute the selective radiomics prediction loss (MSE)
+        """Compute the radiomics prediction loss (MSE)
            targets dicts must contain the key "radiomics" containing a tensor of dim [nb_target_boxes, feature_size]
-           and "empty_pt" containing a tensor of dim [nb_target_boxes] with binary flags
-           
-           Loss computation:
-           - First half of radiomics: always computed
-           - Second half of radiomics: only computed where empty_pt = 0
         """
         assert 'pred_radiomics' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_radiomics = outputs['pred_radiomics'][idx]
         target_radiomics = torch.cat([t['radiomics'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        target_empty_pt = torch.cat([t['empty_pt'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        # Split radiomics into two halves
-        radiomics_dim = target_radiomics.shape[-1]
-        half_dim = radiomics_dim // 2
-        
-        # First half: always compute loss
-        src_first_half = src_radiomics[..., :half_dim]
-        target_first_half = target_radiomics[..., :half_dim]
-        loss_first_half = F.mse_loss(src_first_half, target_first_half, reduction='none')
-        
-        # Second half: compute loss only where empty_pt = 0 (not empty)
-        src_second_half = src_radiomics[..., half_dim:]
-        target_second_half = target_radiomics[..., half_dim:]
-        loss_second_half = F.mse_loss(src_second_half, target_second_half, reduction='none')
-        
-        # Create mask for non-empty points (empty_pt = 0 means valid data)
-        non_empty_mask = (target_empty_pt == 0).float().unsqueeze(-1)  # [N, 1]
-        
-        # Apply mask to second half loss
-        masked_loss_second_half = loss_second_half * non_empty_mask
-        
-        # Combine losses
-        total_loss = loss_first_half.sum() + masked_loss_second_half.sum()
-        
-        # Normalize by total number of valid elements
-        # First half: always all elements, Second half: only non-empty elements
-        num_first_half_elements = loss_first_half.numel()
-        num_second_half_elements = non_empty_mask.sum().item() * (radiomics_dim - half_dim)
-        total_elements = num_first_half_elements + num_second_half_elements
-        
+        loss_radiomics = F.mse_loss(src_radiomics, target_radiomics, reduction='none')
+
         losses = {}
-        losses['loss_radiomics'] = total_loss / total_elements
-            
+        losses['loss_radiomics'] = loss_radiomics.sum() / num_boxes
         return losses
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'superclass_labels': self.loss_superclass_labels,
+            'subclass_labels': self.loss_subclass_labels,
             'cardinality': self.loss_cardinality,
             'coordinates': self.loss_coordinates,
             'radiomics': self.loss_radiomics,
@@ -270,7 +359,7 @@ class SetCriterion(nn.Module):
                         # Intermediate masks losses are too costly to compute, we ignore them.
                         continue
                     kwargs = {}
-                    if loss == 'superclass_labels':
+                    if loss == 'superclass_labels' or loss == 'subclass_labels':
                         # Logging is enabled only for the last layer
                         kwargs = {'log': False}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
@@ -314,14 +403,18 @@ class MLP(nn.Module):
 
 def build(args):
     """
-    Build DETR model for anatomical organ/lesion forecasting.
+    Build DETR model for anatomical organ/lesion forecasting with hierarchical classification.
     """
     device = torch.device(args.device)
 
-    # Build simplified point cloud backbone
+    # Build point cloud backbone with hierarchical label support
     backbone = PointBackbone(
-        num_features=args.original_feature_size,  # Total feature size
-        hidden_dim=args.hidden_dim
+        num_features=args.original_feature_size,
+        num_subclasses=args.num_subclasses,
+        subclass_dim=getattr(args, 'subclass_dim', 64),
+        hidden_dim=args.hidden_dim,
+        ema_momentum=getattr(args, 'ema_momentum', 0.995),
+        use_film=getattr(args, 'use_film', False)
     )
 
     transformer = build_transformer(args)
@@ -330,16 +423,19 @@ def build(args):
         backbone,
         transformer,
         num_superclasses=args.num_superclasses,
+        num_subclasses=args.num_subclasses,
         num_queries=args.num_queries,
         original_feature_size=args.original_feature_size,
-        aux_loss=args.aux_loss
+        aux_loss=args.aux_loss,
+        use_film=getattr(args, 'use_film', False),
     )
     
     matcher = build_matcher(args)
     
-    # Weight dictionary for simplified losses
+    # Weight dictionary for hierarchical losses
     weight_dict = {
         'loss_superclass_ce': getattr(args, 'superclass_loss_coef', 2),
+        'loss_subclass_ce': getattr(args, 'subclass_loss_coef', 2),
         'loss_coordinates': getattr(args, 'coordinates_loss_coef', 5),
         'loss_radiomics': getattr(args, 'radiomics_loss_coef', 5)
     }
@@ -351,11 +447,11 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    # Losses for point cloud forecasting
-    losses = ['superclass_labels', 'coordinates', 'radiomics', 'cardinality']
+    # Losses for hierarchical point cloud forecasting
+    losses = ['superclass_labels', 'subclass_labels', 'coordinates', 'radiomics', 'cardinality']
     
-    criterion = SetCriterion(args.num_superclasses, matcher=matcher, 
-                             weight_dict=weight_dict, losses=losses, superclass_coef=args.superclass_coef)
+    criterion = SetCriterion(args.num_superclasses, args.num_subclasses, matcher=matcher, 
+                             weight_dict=weight_dict, eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)
 
     return model, criterion

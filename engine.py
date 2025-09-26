@@ -22,9 +22,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     
-    # Classification metrics
+    # Hierarchical classification metrics
     metric_logger.add_meter('superclass_error_step1', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     metric_logger.add_meter('superclass_error_step2', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    metric_logger.add_meter('subclass_error_step1', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    metric_logger.add_meter('subclass_error_step2', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     
     # Spatial and feature metrics
     metric_logger.add_meter('coord_error_step1', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
@@ -61,8 +63,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # Choose input for second forward pass
         if use_prediction:
             # Use model's prediction from step 1
-            # ToDo: this was implemented for the synthetic dataset but not yet for letitia
-            # since the missing PET features pose a challenge 
             input2 = make_pointcloud_from(outputs_1, mask_thresh=0.5)
         else:
             # Use ground truth T1 (teacher forcing)
@@ -82,9 +82,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # Total loss (gradients flow through both steps)
         total_loss = loss_1 + loss_2
         
-        # Extract classification errors
+        # Extract hierarchical classification errors
         superclass_error_1 = loss_dict_1.get('superclass_error', torch.tensor(0.0))
         superclass_error_2 = loss_dict_2.get('superclass_error', torch.tensor(0.0))
+        subclass_error_1 = loss_dict_1.get('subclass_error', torch.tensor(0.0))
+        subclass_error_2 = loss_dict_2.get('subclass_error', torch.tensor(0.0))
         
         # Extract spatial and feature errors
         coord_error_1 = loss_dict_1.get('loss_coordinates', torch.tensor(0.0))
@@ -105,14 +107,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
+        
+        # Update EMA embeddings after optimizer step
+        model.update_ema_embeddings()
 
-        # Classification logging
+        # Hierarchical classification logging
         metric_logger.update(
             loss=total_loss.item(),
             loss_step1=loss_1.item(),
             loss_step2=loss_2.item(),
             superclass_error_step1=superclass_error_1.item(),
             superclass_error_step2=superclass_error_2.item(),
+            subclass_error_step1=subclass_error_1.item(),
+            subclass_error_step2=subclass_error_2.item(),
             coord_error_step1=coord_error_1.item(),
             coord_error_step2=coord_error_2.item(),
             radiomics_error_step1=radiomics_error_1.item(),
@@ -129,35 +136,38 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 @torch.no_grad()
 def evaluate(model, criterion, data_loader, device, args):
     """
-    Evaluate temporal point cloud forecasting model using integrated metrics.
+    Evaluate hierarchical temporal point cloud forecasting model using integrated metrics.
     
     Args:
-        model: DETR model with classification
+        model: DETR model with hierarchical classification
         criterion: Loss criterion
         data_loader: Validation data loader
         device: Device to run evaluation on
+        num_superclasses: Number of superclasses (excluding no_object)
+        num_subclasses: Number of subclasses (excluding no_object)
         
     Returns:
-        Dict with comprehensive evaluation metrics
+        Dict with comprehensive hierarchical evaluation metrics
     """
     model.eval()
     criterion.eval()
     
-    from util.metrics import compute_comprehensive_evaluation_metrics
+    from util.metrics import (compute_comprehensive_evaluation_metrics, compute_temporal_dynamics_metrics)
     from models.matcher import HungarianMatcher
     
     # Create matcher for evaluation
     matcher = HungarianMatcher(
-        cost_superclass=args.set_cost_superclass, 
+        cost_superclass=args.set_cost_superclass, cost_subclass=args.set_cost_subclass, 
         cost_coordinates=args.set_cost_coordinates, cost_radiomics=args.set_cost_radiomics
     ) 
     
     # Track all metrics across batches
     all_static_metrics = []
+    all_temporal_metrics = []
 
     no_obj_superclass = args.num_superclasses  # Assuming last superclass is no_object
 
-    print("Evaluating temporal point cloud forecasting...")
+    print("Evaluating hierarchical temporal point cloud forecasting...")
     
     for batch_idx, batch in enumerate(data_loader):
         # Extract inputs and targets from batch
@@ -176,8 +186,7 @@ def evaluate(model, criterion, data_loader, device, args):
         outputs_1 = model(baseline)
         
         # Stage 2: T1 -> T2 prediction (always use model output, no teacher forcing)
-        # input2 = make_pointcloud_from(outputs_1, mask_thresh=0.5)
-        input2 = inputs['T1'].to(device)
+        input2 = make_pointcloud_from(outputs_1, mask_thresh=0.5)
         outputs_2 = model(input2)
         
         # Get matching indices using HungarianMatcher
@@ -191,6 +200,14 @@ def evaluate(model, criterion, data_loader, device, args):
             max_queries=outputs_1['pred_coordinates'].shape[1]
         )
         all_static_metrics.append(static_metrics)
+        
+        # Compute temporal dynamics metrics (lesion appearance/disappearance)
+        if targets_t0:  # If T0 targets are available for temporal analysis
+            temporal_metrics = compute_temporal_dynamics_metrics(
+                outputs_1, outputs_2, targets_t0, targets_t1, targets_t2,
+                no_obj_superclass, max_queries=outputs_1['pred_coordinates'].shape[1]
+            )
+            all_temporal_metrics.append(temporal_metrics)
         
         if batch_idx % 10 == 0:
             print(f"Processed {batch_idx + 1} batches")
@@ -213,18 +230,23 @@ def evaluate(model, criterion, data_loader, device, args):
         
         return aggregated
     
-    # Aggregate static metrics
+    # Aggregate static and temporal metrics
     static_agg = aggregate_batch_metrics(all_static_metrics)
+    temporal_agg = aggregate_batch_metrics(all_temporal_metrics)
     
-    # Use static metrics as results
+    # Combine all results with hierarchical naming
     results = {}
     
     # Static metrics (classification, coordinates, features)
     for key, value in static_agg.items():
         results[key] = value
     
+    # Temporal dynamics metrics
+    for key, value in temporal_agg.items():
+        results[key] = value
+    
     # Print comprehensive results
-    print("Evaluation Results:")
+    print("Hierarchical Evaluation Results:")
     print("=" * 60)
     
     # T0->T1 Prediction Results
@@ -238,6 +260,10 @@ def evaluate(model, criterion, data_loader, device, args):
             print(f"  Feature Error: {results['t1_radiomics_mse']:.4f}")
         if 't1_superclass_accuracy' in results:
             print(f"  Superclass: Acc={results['t1_superclass_accuracy']:.3f}, F1={results.get('t1_superclass_f1', 0.0):.3f}")
+        if 't1_subclass_accuracy' in results:
+            print(f"  Subclass: Acc={results['t1_subclass_accuracy']:.3f}, F1={results.get('t1_subclass_f1', 0.0):.3f}")
+        if 't1_hierarchical_accuracy' in results:
+            print(f"  Hierarchical Accuracy: {results['t1_hierarchical_accuracy']:.3f}")
         print()
     
     # T1->T2 Prediction Results
@@ -251,30 +277,50 @@ def evaluate(model, criterion, data_loader, device, args):
             print(f"  Feature Error: {results['t2_radiomics_mse']:.4f}")
         if 't2_superclass_accuracy' in results:
             print(f"  Superclass: Acc={results['t2_superclass_accuracy']:.3f}, F1={results.get('t2_superclass_f1', 0.0):.3f}")
+        if 't2_subclass_accuracy' in results:
+            print(f"  Subclass: Acc={results['t2_subclass_accuracy']:.3f}, F1={results.get('t2_subclass_f1', 0.0):.3f}")
+        if 't2_hierarchical_accuracy' in results:
+            print(f"  Hierarchical Accuracy: {results['t2_hierarchical_accuracy']:.3f}")
         print()
+    
+    # Temporal Dynamics Results
+    print("Temporal Dynamics:")
+    print("T0 -> T1 Lesion Dynamics:")
+    if 'lesion_disappear_t0_t1_accuracy' in results:
+        print(f"  Disappearance: Acc={results['lesion_disappear_t0_t1_accuracy']:.3f}, F1={results.get('lesion_disappear_t0_t1_f1', 0.0):.3f}")
+    if 'lesion_appear_t0_t1_accuracy' in results:
+        print(f"  Appearance: Acc={results['lesion_appear_t0_t1_accuracy']:.3f}, F1={results.get('lesion_appear_t0_t1_f1', 0.0):.3f}")
+    
+    print("T1 -> T2 Lesion Dynamics:")
+    if 'lesion_disappear_t1_t2_accuracy' in results:
+        print(f"  Disappearance: Acc={results['lesion_disappear_t1_t2_accuracy']:.3f}, F1={results.get('lesion_disappear_t1_t2_f1', 0.0):.3f}")
+    if 'lesion_appear_t1_t2_accuracy' in results:
+        print(f"  Appearance: Acc={results['lesion_appear_t1_t2_accuracy']:.3f}, F1={results.get('lesion_appear_t1_t2_f1', 0.0):.3f}")
     
     return results
 
 
 def make_pointcloud_from(outputs, mask_thresh=0.5):
     """
-    Reconstruct point cloud format from model outputs.
+    Reconstruct point cloud format from hierarchical model outputs.
     
     Args:
         outputs: Dict containing:
-            - 'pred_superclass': [batch_size, num_queries, num_superclasses + 1]
+            - 'pred_superclass': [batch_size, num_queries, num_superclasses + 1] (hierarchical)
+            - 'pred_subclass': [batch_size, num_queries, num_subclasses] (hierarchical)
             - 'pred_coordinates': [batch_size, num_queries, 3] 
             - 'pred_radiomics': [batch_size, num_queries, num_radiomics]
         mask_thresh: Threshold for determining valid points based on no_object probability
         
     Returns:
         NestedTensor with:
-            - tensors: [batch_size, max_points, total_features] where features = [x,y,z,radiomics...,superclass]
+            - tensors: [batch_size, max_points, total_features] where features = [x,y,z,radiomics...,superclass,subclass]
             - mask: [batch_size, max_points] - True for padding, False for valid points
     """
     
-    # Classification
+    # Hierarchical classification
     pred_super_probs = torch.softmax(outputs['pred_superclass'], dim=-1)  # [batch, queries, num_superclasses + 1]
+    pred_sub_probs = torch.softmax(outputs['pred_subclass'], dim=-1)      # [batch, queries, num_subclasses]
     
     # Assuming last superclass is no_object, mask where no_object prob <= threshold
     no_obj_probs = pred_super_probs[..., -1]  # [batch, queries]
@@ -282,16 +328,19 @@ def make_pointcloud_from(outputs, mask_thresh=0.5):
     
     # Get predicted classes (excluding no_object class for superclass)
     pred_superclasses = torch.argmax(pred_super_probs[..., :-1], dim=-1).float()  # [batch, queries]
+    pred_subclasses = torch.argmax(pred_sub_probs, dim=-1).float()                # [batch, queries]
     
     # Prepare class features
     superclasses = pred_superclasses.unsqueeze(-1)  # [batch, queries, 1]
+    subclasses = pred_subclasses.unsqueeze(-1)      # [batch, queries, 1]
+    class_features = torch.cat([superclasses, subclasses], dim=-1)  # [batch, queries, 2]
     
     # Concatenate coordinates + radiomics + class features to form full feature vector
     coordinates = outputs['pred_coordinates']  # [batch, queries, 3]
     radiomics = outputs['pred_radiomics']     # [batch, queries, num_radiomics]
     
-    # Combine all features: [x, y, z, radiomics..., superclass]
-    point_features = torch.cat([coordinates, radiomics, superclasses], dim=-1)  # [batch, queries, total_features]
+    # Combine all features: [x, y, z, radiomics..., superclass, subclass]
+    point_features = torch.cat([coordinates, radiomics, class_features], dim=-1)  # [batch, queries, total_features]
     
     # Create NestedTensor - mask follows NestedTensor convention (True = padding)
     return NestedTensor(point_features, ~valid_mask)  # ~valid_mask: True=padding, False=valid

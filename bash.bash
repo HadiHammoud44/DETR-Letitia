@@ -39,27 +39,26 @@ echo "Output directory: $OUTPUT_DIR"
 python main.py \
     --device='cuda' \
     --output_dir="$OUTPUT_DIR" \
-    --enc_layers=3 \
-    --dec_layers=3 \
-    --original_feature_size=113 \
+    --original_feature_size=10 \
     --hidden_dim=128 \
     --dim_feedforward=512 \
     --nheads=8 \
-    --num_queries=63 \
-    --epochs=1000 \
-    --batch_size=8 \
+    --subclass_dim=92 \
+    --num_subclasses=92 \
+    --num_queries=72 \
+    --epochs=500 \
+    --batch_size=64 \
     --weight_decay=0.001 \
     --clip_max_norm=1 \
     --dropout=0.1 \
     --num_workers=4 \
-    --lr_drop=100000 \ 
+    --lr_drop=100000 \
     --data_root='path/to/data/dir' \
     --superclass_loss_coef=1.0 \
-    --coordinates_loss_coef=4.0 \
-    --radiomics_loss_coef=5.0 \
-    --set_cost_superclass=2.0 \
-    --set_cost_coordinates=1.0 \
-    --set_cost_radiomics=0.03 \
+    --subclass_loss_coef=10.0 \
+    --coordinates_loss_coef=20.0 \
+    --radiomics_loss_coef=20.0 \
+    --eos_coef=0.3 \
     --NO_schedule_sampling \
     2>&1 | tee "$OUTPUT_DIR/training_log.txt"
 

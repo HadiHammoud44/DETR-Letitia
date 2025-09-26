@@ -49,10 +49,16 @@ def get_args_parser():
     parser.add_argument('--num_queries', default=64, type=int,
                         help="Number of query slots")
     parser.add_argument('--original_feature_size', default=69, type=int,
-                        help="Size of the original radiomics feature vector per point (3D coords + radiomics + empty_pt + superclass)")
+                        help="Size of the original radiomics feature vector per point (3D coords + radiomics + superclass + subclass)")
     parser.add_argument('--num_superclasses', default=2, type=int,
                         help="Number of superclasses (excluding no_object class)")
+    parser.add_argument('--num_subclasses', default=92, type=int,
+                        help="Number of subclasses (excluding no_object)")
+    parser.add_argument('--subclass_dim', default=64, type=int,
+                        help="Dimension of subclass embeddings")
     parser.add_argument('--pre_norm', action='store_true')
+    parser.add_argument('--use_film', action='store_true',
+                        help="Use FiLM conditioning in the transformer encoder")
 
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
@@ -60,6 +66,8 @@ def get_args_parser():
     # * Matcher
     parser.add_argument('--set_cost_superclass', default=1, type=float,
                         help="Superclass coefficient in the matching cost")
+    parser.add_argument('--set_cost_subclass', default=1, type=float,
+                        help="Subclass coefficient in the matching cost")
     parser.add_argument('--set_cost_coordinates', default=5, type=float,
                         help="L2 coordinates coefficient in the matching cost")
     parser.add_argument('--set_cost_radiomics', default=0.0, type=float,
@@ -67,25 +75,19 @@ def get_args_parser():
     # * Loss coefficients
     parser.add_argument('--superclass_loss_coef', default=1, type=float,
                         help="Superclass classification coefficient in the loss")
+    parser.add_argument('--subclass_loss_coef', default=1, type=float,
+                        help="Subclass classification coefficient in the loss")
     parser.add_argument('--radiomics_loss_coef', default=3, type=float)
     parser.add_argument('--coordinates_loss_coef', default=5, type=float)
-    parser.add_argument('--superclass_coef', default=[0.75, 2.0, 0.15], nargs='+', type=float,
-                        help="Superclass weights to handle class imbalance (list of floats of size num_superclasses + 1 including no-object)")
+    parser.add_argument('--eos_coef', default=0.1, type=float,
+                        help="Relative classification weight of the no-object class")
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='letitia')
     parser.add_argument('--data_root', type=str, help='Root directory containing TP0, TP1, TP2 folders')
     parser.add_argument('--split_ratio', default=(0.8, 0.15, 0.05), nargs=3, type=float, help='Train/val/test split ratios')
-    parser.add_argument('--val_ids', default=[18, 50, 68, 78, 91, 95, 102, 106, 111, 133, 142, 150, 177, 210, 220, 238, 245], nargs='+', type=int,
-                        help='List of integers specifying validation sample IDs for custom split (overrides split_ratio if provided)')
     parser.add_argument('--seed', default=42, type=int, help='Random seed for data splitting')
     
-    # Additional parameters for fit dataset
-    parser.add_argument('--train_data_root', type=str, default='/mnt/letitia/scratch/students/hhammoud/detr/synthetic_dataset_test500/',
-                        help='Root directory for training data (used with fit dataset)')
-    parser.add_argument('--val_data_root', type=str, default='/mnt/letitia/scratch/students/hhammoud/detr/synthetic_dataset_test/',
-                        help='Root directory for validation data (used with fit dataset)')
-
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
@@ -127,7 +129,6 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    # exclude some parameters from weight decay
     no_decay, with_decay = [], []
     no_decay_names = []  # Track names for debugging
 
@@ -143,7 +144,7 @@ def main(args):
         parent = name.rsplit('.', 1)[0]  # original case
         parent_mod = modules.get(parent, None)
 
-        # 0D/1D params: biases, norm weights, temps etc.
+        # 0D/1D params: biases, norm weights, temps, FiLM γ/β, etc.
         is_scalar_or_1d = (p.ndim <= 1)
 
         # positional embeddings (narrow patterns)
@@ -156,7 +157,15 @@ def main(args):
             "relative_position_bias_table", "rel_pos_bias", "rel_pos_table"
         ])
 
-        if (is_scalar_or_1d or is_pos_embed or is_rel_pos_table):
+        # prototype/codebook-like params
+        is_prototype_like = any(t in lname for t in ["prototype", "proto"])
+
+        # FiLM affine: exclude ONLY if it's a 1-D affine vector
+        last = lname.rsplit('.', 1)[-1]
+        is_film_affine = (p.ndim == 1) and (last in {"gamma", "beta", "scale", "shift"})
+
+        if (is_scalar_or_1d or is_pos_embed
+            or is_rel_pos_table or is_prototype_like or is_film_affine):
             no_decay.append(p)
             no_decay_names.append(name)
         else:
@@ -172,6 +181,7 @@ def main(args):
         {"params": no_decay, "weight_decay": 0.0},
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr)
+
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma=args.lr_gamma)
 
     dataset_train = build_dataset(image_set='train', args=args)

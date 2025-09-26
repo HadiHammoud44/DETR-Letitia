@@ -3,11 +3,11 @@
 Letitia Dataset for dynamic organ/lesion forecasting.
 Each sample contains point clouds at 3 time steps (TP0, TP1, TP2) with radiomics features.
 
-Data format per point: [x, y, z, radiomics_features..., empty_pt, superclass_label]
+Data format per point: [x, y, z, radiomics_features..., superclass_label, subclass_label]
 - Coordinates: 3D spatial position (x, y, z)
 - Radiomics: Feature vector extracted from medical imaging
-- Empty_pt: Binary flag (0/1) indicating if second half of radiomics is empty
 - Superclass: High-level anatomical classification (e.g., healthy, benign, malignant)
+- Subclass: Fine-grained classification within superclass (e.g., specific lesion types)
 """
 import os
 import torch
@@ -27,17 +27,14 @@ class LetitiaDataset(Dataset):
         split_ratio: Tuple of ratios for train/val/test splits
         transforms: Optional transforms to apply to the data
         seed: Random seed for reproducibility
-        val_ids: Optional list of integers specifying validation sample IDs.
-                 If provided, ignores split_ratio and uses custom train/val split.
     """
     
-    def __init__(self, data_root: str, split: str = 'train', split_ratio=(0.7, 0.2, 0.1), transforms=None, seed=0, val_ids=None):
+    def __init__(self, data_root: str, split: str = 'train', split_ratio=(0.7, 0.2, 0.1), transforms=None, seed=0):
         self.data_root = Path(data_root)
         self.split = split
         self.split_ratio = split_ratio
         self.transforms = transforms
         self.seed = seed
-        self.val_ids = val_ids
         
         # Timestep folders
         self.TP0_dir = self.data_root / 'TP0'
@@ -57,32 +54,18 @@ class LetitiaDataset(Dataset):
         TP0_files = list(self.TP0_dir.glob('*.pt'))  
         
         sample_ids = [f.stem for f in TP0_files]
-        
-        # If val_ids is provided, use custom validation split
-        if self.val_ids is not None:
-            val_ids_str = [str(vid) for vid in self.val_ids]  # Convert to strings for comparison
-            
-            if self.split == 'val':
-                # Return only samples whose IDs are in val_ids
-                sample_ids = [sid for sid in sample_ids if sid in val_ids_str]
-            elif self.split == 'train':
-                # Return only samples whose IDs are NOT in val_ids
-                sample_ids = [sid for sid in sample_ids if sid not in val_ids_str]
-            # test split is ignored when val_ids is provided
-            elif self.split == 'test':
-                sample_ids = []
-        else:
-            # Original behavior: assign based on split_ratio and seed
-            np.random.seed(self.seed)
-            np.random.shuffle(sample_ids)
-            num_train = int(len(sample_ids) * self.split_ratio[0])
-            num_val = int(len(sample_ids) * self.split_ratio[1])
-            if self.split == 'train':
-                sample_ids = sample_ids[:num_train]
-            elif self.split == 'val':
-                sample_ids = sample_ids[num_train:num_train + num_val]
-            elif self.split == 'test':
-                sample_ids = sample_ids[num_train + num_val:]
+                
+        # Assign based on split and seed
+        np.random.seed(self.seed)
+        np.random.shuffle(sample_ids)
+        num_train = int(len(sample_ids) * self.split_ratio[0])
+        num_val = int(len(sample_ids) * self.split_ratio[1])
+        if self.split == 'train':
+            sample_ids = sample_ids[:num_train]
+        elif self.split == 'val':
+            sample_ids = sample_ids[num_train:num_train + num_val]
+        elif self.split == 'test':
+            sample_ids = sample_ids[num_train + num_val:]
         
         return sample_ids
             
@@ -133,7 +116,6 @@ def pad_and_mask(batch_data: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Te
     
     Args:
         batch_data: List of tensors, each of shape [num_points, num_features]
-                   Features: [x, y, z, radiomics..., empty_pt, superclass_label]
         
     Returns:
         padded_tensor: Tensor of shape [batch_size, max_points, num_features]
@@ -148,13 +130,13 @@ def pad_and_mask(batch_data: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Te
     lengths = [tensor.shape[0] for tensor in batch_data]
     max_length = max(lengths)
     
-    # Create padded tensors and mask
+    # Create padded tensor and mask
     padded_tensor = torch.zeros(batch_size, max_length, num_features, dtype=batch_data[0].dtype)
     mask = torch.ones(batch_size, max_length, dtype=torch.bool)  # True = padded
     
     # Fill in the data and update mask
-    for i, (features, length) in enumerate(zip(batch_data, lengths)):
-        padded_tensor[i, :length] = features
+    for i, (tensor, length) in enumerate(zip(batch_data, lengths)):
+        padded_tensor[i, :length] = tensor
         mask[i, :length] = False  # False = real data
     
     return padded_tensor, mask
@@ -197,7 +179,7 @@ def custom_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict:
     
     # Create targets in DETR format
     targets = {
-        'T0': [_format_target(tp0) for tp0 in TP0_data],  # T0 targets
+        'T0': [_format_target(tp0) for tp0 in TP0_data],  # T0 targets with all keys for temporal dynamics
         'T1': [_format_target(tp1) for tp1 in TP1_data],  # T1 targets for T0→T1 prediction
         'T2': [_format_target(tp2) for tp2 in TP2_data]   # T2 targets for T1→T2 prediction
     }
@@ -215,30 +197,30 @@ def _format_target(point_cloud: torch.Tensor) -> Dict[str, torch.Tensor]:
     
     Args:
         point_cloud: Tensor of shape [num_points, num_features]
-                    Features: [x, y, z, radiomics..., empty_pt, superclass_label]
+                    Features: [x, y, z, radiomics..., superclass_label, subclass_label]
     
     Returns:
         Dict with:
             - 'superclass': Superclass labels [num_points]
+            - 'subclass': Subclass labels [num_points]
             - 'coordinates': 3D coordinates [num_points, 3] 
             - 'radiomics': Radiomics features [num_points, num_radiomics_features]
-            - 'empty_pt': Binary flags indicating empty second half [num_points]
     """
     # Extract components from point cloud
     coordinates = point_cloud[:, :3]                    # First 3: x, y, z coordinates
     radiomics = point_cloud[:, 3:-2]                   # Middle: radiomics features
-    empty_pt = point_cloud[:, -2]                      # Second to last: empty_pt flag
-    superclass = point_cloud[:, -1].long()             # Last: superclass labels
+    superclass = point_cloud[:, -2].long()             # Second to last: superclass labels
+    subclass = point_cloud[:, -1].long()               # Last: subclass labels
     
     return {
         'superclass': superclass,
+        'subclass': subclass,
         'coordinates': coordinates,
-        'radiomics': radiomics,
-        'empty_pt': empty_pt
+        'radiomics': radiomics
     }
 
 
-def build_letitia_dataset(data_root: str, split: str = 'train', split_ratio=(0.7, 0.2, 0.1), transforms=None, seed=0, val_ids=None) -> LetitiaDataset:
+def build_letitia_dataset(data_root: str, split: str = 'train', split_ratio=(0.7, 0.2, 0.1), transforms=None, seed=0) -> LetitiaDataset:
     """
     Builder function for LetitiaDataset.
     
@@ -248,12 +230,11 @@ def build_letitia_dataset(data_root: str, split: str = 'train', split_ratio=(0.7
         split_ratio: Tuple of ratios for train/val/test splits
         transforms: Optional transforms to apply
         seed: Random seed for reproducibility
-        val_ids: Optional list of integers specifying validation sample IDs
         
     Returns:
         LetitiaDataset instance
     """
-    return LetitiaDataset(data_root=data_root, split=split, split_ratio=split_ratio, transforms=transforms, seed=seed, val_ids=val_ids)
+    return LetitiaDataset(data_root=data_root, split=split, split_ratio=split_ratio, transforms=transforms, seed=seed)
 
 
 def get_feature_info(data_root: str) -> Dict[str, int]:
@@ -269,6 +250,7 @@ def get_feature_info(data_root: str) -> Dict[str, int]:
             - 'num_coordinates': Number of coordinate features (should be 3)
             - 'num_radiomics': Number of radiomics features
             - 'num_superclasses': Number of unique superclass labels (approximate)
+            - 'num_subclasses': Number of unique subclass labels (approximate)
     """
     data_root = Path(data_root)
     TP0_dir = data_root / 'TP0'
@@ -282,15 +264,18 @@ def get_feature_info(data_root: str) -> Dict[str, int]:
     
     total_features = sample_data.shape[1]
     num_coordinates = 3  # x, y, z
-    num_radiomics = total_features - 5  # exclude x,y,z, empty_pt, and superclass
+    num_radiomics = total_features - 5  # exclude x,y,z, superclass, and subclass
     
     # Estimate number of classes from unique labels in sample
-    unique_superclasses = torch.unique(sample_data[:, -1])
+    unique_superclasses = torch.unique(sample_data[:, -2])
+    unique_subclasses = torch.unique(sample_data[:, -1])
     num_superclasses = len(unique_superclasses)
+    num_subclasses = len(unique_subclasses)
     
     return {
         'total_features': total_features,
         'num_coordinates': num_coordinates, 
         'num_radiomics': num_radiomics,
-        'num_superclasses': num_superclasses
+        'num_superclasses': num_superclasses,
+        'num_subclasses': num_subclasses
     }
